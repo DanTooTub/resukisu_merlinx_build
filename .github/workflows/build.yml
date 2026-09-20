@@ -1,0 +1,163 @@
+name: Build Kernel by DanTooTub
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Device codename'
+        required: true
+        default: 'merlin'
+        type: choice
+        options:
+          - merlin
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      DEVICE: ${{ github.event.inputs.device }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+      # 1. Забираем репозиторий
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Читаем config.env в переменные окружения
+      - name: Load config
+        run: |
+          grep -v -E "^#|^\n" config.env | sed 's/ #.*//; s/#.*//' >> $GITHUB_ENV
+          echo "BUILD_TIME=$(TZ=UTC date '+%Y%m%d%H%M')" >> $GITHUB_ENV
+
+      # 3. Делаем swap (10 ГБ) — для сборки ядра на 16 ГБ ОЗУ
+      - name: Set swap
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      # 4. Ставим зависимости
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev liblz4-tool \
+            libncurses6 libncurses-dev libsdl1.2-dev libssl-dev \
+            libwxgtk3.2-dev libxml2 libxml2-utils lzop pngcrush rsync \
+            schedtool squashfs-tools xsltproc zip zlib1g-dev
+          mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+
+      # 5. Качаем GCC 64-bit (aarch64)
+      - name: Download GCC 64
+        if: env.USE_GCC == 'true' && env.USE_GCC_64 == 'true'
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_workspace
+          wget -q -O gcc-64.tar.xz ${{ env.GCC_64_SOURCE }}
+          mkdir gcc-64
+          tar -C gcc-64/ -xJf gcc-64.tar.xz
+          rm gcc-64.tar.xz
+          if [[ "$(find ./gcc-64 -mindepth 1 -maxdepth 1 -type d | wc -l)" == "1" ]]; then
+              mv -f "$(find ./gcc-64 -mindepth 1 -maxdepth 1 -type d)"/* ./gcc-64
+          fi
+
+      # 6. Качаем GCC 32-bit (arm)
+      - name: Download GCC 32
+        if: env.USE_GCC == 'true' && env.USE_GCC_32 == 'true'
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_workspace
+          wget -q -O gcc-32.tar.xz ${{ env.GCC_32_SOURCE }}
+          mkdir gcc-32
+          tar -C gcc-32/ -xJf gcc-32.tar.xz
+          rm gcc-32.tar.xz
+          if [[ "$(find ./gcc-32 -mindepth 1 -maxdepth 1 -type d | wc -l)" == "1" ]]; then
+              mv -f "$(find ./gcc-32 -mindepth 1 -maxdepth 1 -type d)"/* ./gcc-32
+          fi
+
+      # 7. Клонируем исходники ядра
+      - name: Clone kernel source
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_workspace
+          git clone --recursive ${{ env.KERNEL_SOURCE }} -b ${{ env.KERNEL_SOURCE_BRANCH }} android-kernel --depth=1
+
+      # 8. Ставим ReSukiSU (сам применит хуки для non-GKI)
+      - name: Setup ReSukiSU
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+          curl -LSs "$KERNELSU_SETUP_SOURCE" | bash -s main
+
+      # 9. Включаем CONFIG_KSU в defconfig
+      - name: Enable CONFIG_KSU
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+          DEFCONFIG=arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+          if grep -q "CONFIG_KSU" $DEFCONFIG; then
+              sed -i 's/# CONFIG_KSU is not set/CONFIG_KSU=y/g' $DEFCONFIG
+              sed -i 's/CONFIG_KSU=n/CONFIG_KSU=y/g' $DEFCONFIG
+          else
+              echo "CONFIG_KSU=y" >> $DEFCONFIG
+          fi
+
+      # 10. Отключаем LTO и Werror
+      - name: Tweak defconfig
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+          DEFCONFIG=arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+          if [ "${{ env.DISABLE_LTO }}" = "true" ]; then
+              sed -i 's/CONFIG_LTO=y/CONFIG_LTO=n/' $DEFCONFIG
+              sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_CLANG=n/' $DEFCONFIG
+              sed -i 's/CONFIG_THINLTO=y/CONFIG_THINLTO=n/' $DEFCONFIG
+              echo "CONFIG_LTO_NONE=y" >> $DEFCONFIG
+          fi
+          if [ "${{ env.DISABLE_CC_WERROR }}" = "true" ]; then
+              echo "CONFIG_CC_WERROR=n" >> $DEFCONFIG
+          fi
+
+      # 11. Настраиваем ccache
+      - name: Setup ccache
+        if: env.ENABLE_CCACHE == 'true'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-${{ env.DEVICE }}
+          max-size: 2G
+
+      # 12. Собираем ядро
+      - name: Build kernel
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+          export PATH=$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH
+          export PATH=$GITHUB_WORKSPACE/kernel_workspace/gcc-32/bin:$PATH
+          export KBUILD_BUILD_HOST=GitHub-Actions
+          export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
+
+          make -j$(nproc --all) O=out ARCH=${{ env.KERNEL_ARCH }} ${{ env.EXTRA_CMDS }} ${DEVICE}_defconfig
+          make -j$(nproc --all) O=out ARCH=${{ env.KERNEL_ARCH }} ${{ env.EXTRA_CMDS }} CC="ccache gcc"
+
+      # 13. Проверяем, что Image.gz-dtb собрался
+      - name: Check output
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_workspace
+          if [ -f android-kernel/out/arch/${{ env.KERNEL_ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }} ]; then
+              echo "BUILD_OK=true" >> $GITHUB_ENV
+          else
+              echo "Kernel not found!"
+              exit 1
+          fi
+
+      # 14. Качаем AnyKernel3 и упаковываем
+      - name: Package AnyKernel3
+        if: env.BUILD_OK == 'true' && env.USE_ANYKERNEL3 == 'true'
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_workspace
+          git clone ${{ env.ANYKERNEL3_SOURCE }} -b ${{ env.ANYKERNEL3_BRANCH }} --depth=1 AnyKernel3
+          cp android-kernel/out/arch/${{ env.KERNEL_ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }} AnyKernel3/
+          rm -rf AnyKernel3/.git* AnyKernel3/README.md
+
+      # 15. Загружаем артефакт
+      - name: Upload AnyKernel3
+        if: env.BUILD_OK == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/AnyKernel3/*
